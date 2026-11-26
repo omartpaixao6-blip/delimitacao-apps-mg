@@ -1,6 +1,8 @@
 import os
 import json
 import time
+import shutil
+import tempfile
 import zipfile
 import urllib.parse
 import urllib.request
@@ -10,27 +12,23 @@ import pandas as pd
 # Bounding Box aproximado de Minas Gerais (EPSG:4674 - SIRGAS 2000)
 BBOX_MG = (-51.05, -22.93, -39.85, -14.23)
 
-# Endpoints WFS do Acervo Fundiário do INCRA (SIGEF Particular e SNCI)
-FONTES_WFS = [
-    {
-        "nome": "sigef_particular",
-        "url": "https://acervofundiario.incra.gov.br/i3geo/ogc.php?tema=certificada_sigef_particular_mg",
-        "typename": "certificada_sigef_particular_mg"
-    },
-    {
-        "nome": "snci_privado",
-        "url": "https://acervofundiario.incra.gov.br/i3geo/ogc.php?tema=imoveis_privados_mg",
-        "typename": "imoveis_privados_mg"
-    }
-]
+WFS_BASE_URL = "https://geonodeincra.serpro.gov.br/geoserver/ows"
+TYPENAME = "geonode:sigef_geo"
+
+URL_SHAPE_ZIP_COMPLETO = (
+    "https://geonodeincra.serpro.gov.br/geoserver/ows"
+    "?service=WFS&version=1.0.0&request=GetFeature"
+    "&typename=geonode%3Asigef_geo&outputFormat=SHAPE-ZIP"
+    "&srs=EPSG%3A4674&format_options=charset%3AUTF-8"
+)
 
 PASTA_SAIDA = "dist_incra"
 CAMINHO_GPKG = os.path.join(PASTA_SAIDA, "incra_mg.gpkg")
 CAMINHO_ZIP  = os.path.join(PASTA_SAIDA, "incra_mg.zip")
 
 
-def baixar_camada_wfs(fonte, tamanho_pagina=2000):
-    """Baixa feições WFS paginadas em formato GeoJSON/GML e retorna um GeoDataFrame."""
+def baixar_wfs_paginado_mg(tamanho_pagina=2000):
+    """Consulta o GeoServer SERPRO via WFS 2.0.0 filtrado pelo BBOX de Minas Gerais."""
     gdfs = []
     start_index = 0
     xmin, ymin, xmax, ymax = BBOX_MG
@@ -38,21 +36,21 @@ def baixar_camada_wfs(fonte, tamanho_pagina=2000):
     while True:
         params = {
             "service": "WFS",
-            "version": "1.1.0",
+            "version": "2.0.0",
             "request": "GetFeature",
-            "typeName": fonte["typename"],
+            "typeNames": TYPENAME,
             "outputFormat": "application/json",
             "srsName": "EPSG:4674",
-            "bbox": f"{xmin},{ymin},{xmax},{ymax},EPSG:4674",
-            "maxFeatures": tamanho_pagina,
+            "bbox": f"{ymin},{xmin},{ymax},{xmax},urn:ogc:def:crs:EPSG::4674",
+            "count": tamanho_pagina,
             "startIndex": start_index,
         }
-        url_req = f"{fonte['url']}&{urllib.parse.urlencode(params)}"
-        print(f"[{fonte['nome']}] Baixando lote a partir do índice {start_index}...")
+        url_req = f"{WFS_BASE_URL}?{urllib.parse.urlencode(params)}"
+        print(f"[WFS-MG] Baixando lote a partir do índice {start_index}...")
 
         try:
             req = urllib.request.Request(url_req, headers={"User-Agent": "QGIS-Plugin-APPs-MG/1.1"})
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=90) as resp:
                 conteudo = resp.read().decode("utf-8", errors="ignore")
 
             dados = json.loads(conteudo)
@@ -62,16 +60,16 @@ def baixar_camada_wfs(fonte, tamanho_pagina=2000):
 
             gdf_lote = gpd.GeoDataFrame.from_features(feicoes, crs="EPSG:4674")
             gdfs.append(gdf_lote)
-            print(f"[{fonte['nome']}] +{len(gdf_lote)} feições recebidas.")
+            print(f"[WFS-MG] +{len(gdf_lote)} feições recebidas (acumulado: {sum(len(g) for g in gdfs)}).")
 
             if len(feicoes) < tamanho_pagina:
                 break
 
             start_index += tamanho_pagina
-            time.sleep(1.5)  # Pausa cordial para não sobrecarregar o servidor do INCRA
+            time.sleep(1.0)
 
         except Exception as e:
-            print(f"[{fonte['nome']}] Aviso/interrupção no índice {start_index}: {e}")
+            print(f"[WFS-MG] Interrupção no índice {start_index}: {e}")
             break
 
     if not gdfs:
@@ -80,77 +78,95 @@ def baixar_camada_wfs(fonte, tamanho_pagina=2000):
     return gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True), crs="EPSG:4674")
 
 
-def limpar_e_padronizar(gdf, origem):
+def baixar_via_shape_zip():
+    """Fallback: baixa o SHAPE-ZIP oficial completo e recorta espacialmente pelo BBOX de MG."""
+    print("[FALLBACK] Baixando SHAPE-ZIP completo do GeoServer SERPRO...")
+    tmp_dir = tempfile.mkdtemp(prefix="incra_zip_")
+    zip_local = os.path.join(tmp_dir, "sigef_geo.zip")
+
+    try:
+        req = urllib.request.Request(URL_SHAPE_ZIP_COMPLETO, headers={"User-Agent": "QGIS-Plugin-APPs-MG/1.1"})
+        with urllib.request.urlopen(req, timeout=300) as resp, open(zip_local, "wb") as f_out:
+            shutil.copyfileobj(resp, f_out)
+
+        with zipfile.ZipFile(zip_local, "r") as zf:
+            zf.extractall(tmp_dir)
+
+        shps = [os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir) if f.lower().endswith(".shp")]
+        if not shps:
+            return None
+
+        print("[FALLBACK] Lendo shapefile filtrado pelo retângulo de Minas Gerais...")
+        gdf = gpd.read_file(shps[0], bbox=BBOX_MG)
+        if gdf.crs is None:
+            gdf = gdf.set_crs("EPSG:4674")
+        elif gdf.crs.to_epsg() != 4674:
+            gdf = gdf.to_crs("EPSG:4674")
+        return gdf
+
+    except Exception as e:
+        print(f"[FALLBACK] Falha ao baixar SHAPE-ZIP: {e}")
+        return None
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def limpar_e_padronizar(gdf):
     """Filtra linhas com codigo_imo nulo, valida geometrias e mantém colunas essenciais."""
     if gdf is None or gdf.empty:
         return None
 
-    # Normaliza nomes das colunas para minúsculo
     gdf.columns = [c.lower() for c in gdf.columns]
 
-    # Garante existência de codigo_imo e remove registros nulos ou vazios
     if "codigo_imo" not in gdf.columns:
+        print(f"Colunas disponíveis na camada: {list(gdf.columns)}")
         return None
 
     gdf["codigo_imo"] = gdf["codigo_imo"].astype(str).str.strip()
     gdf = gdf[
         gdf["codigo_imo"].notna()
         & (gdf["codigo_imo"] != "")
-        & (gdf["codigo_imo"].str.lower() != "none")
-        & (gdf["codigo_imo"].str.lower() != "nan")
+        & (~gdf["codigo_imo"].str.lower().isin(["none", "nan", "null"]))
     ].copy()
 
     if gdf.empty:
         return None
 
-    # Filtra registros cujo município (muniorig1) pertence a MG (código IBGE iniciado em 31), quando preenchido
+    # Filtra municípios de MG (código IBGE iniciado em 31), mantendo linhas onde muniorig1 está nulo
     if "muniorig1" in gdf.columns:
         mun = gdf["muniorig1"].astype(str).str.strip()
-        mascara_mg = mun.str.startswith("31") | mun.isin(["", "None", "nan", "NULL"])
+        mascara_mg = mun.str.startswith("31") | mun.str.lower().isin(["", "none", "nan", "null"])
         gdf = gdf[mascara_mg].copy()
     else:
         gdf["muniorig1"] = ""
 
-    # Mantém apenas colunas essenciais para reduzir tamanho do GeoPackage
-    colunas_desejadas = ["codigo_imo", "muniorig1", "nome_area", "area_ha", "geometry"]
-    for col in colunas_desejadas:
-        if col not in gdf.columns and col != "geometry":
+    for col in ["nome_area", "area_ha"]:
+        if col not in gdf.columns:
             gdf[col] = ""
 
-    gdf["fonte"] = origem
-    gdf = gdf[["codigo_imo", "muniorig1", "nome_area", "area_ha", "fonte", "geometry"]].copy()
+    gdf = gdf[["codigo_imo", "muniorig1", "nome_area", "area_ha", "geometry"]].copy()
 
-    # Corrige eventuais geometrias inválidas e filtra pelo retângulo de MG
     gdf = gdf[gdf.geometry.notnull() & ~gdf.geometry.is_empty].copy()
     gdf["geometry"] = gdf.geometry.buffer(0)
     gdf = gdf.cx[BBOX_MG[0]:BBOX_MG[2], BBOX_MG[1]:BBOX_MG[3]]
+    gdf = gdf.drop_duplicates(subset=["codigo_imo"], keep="first")
 
     return gdf
 
 
 def main():
     os.makedirs(PASTA_SAIDA, exist_ok=True)
-    camadas_consolidadas = []
 
-    for fonte in FONTES_WFS:
-        gdf_bruto = baixar_camada_wfs(fonte)
-        gdf_limpo = limpar_e_padronizar(gdf_bruto, fonte["nome"])
-        if gdf_limpo is not None and not gdf_limpo.empty:
-            print(f"[{fonte['nome']}] Total após limpeza: {len(gdf_limpo)} imóveis válidos.")
-            camadas_consolidadas.append(gdf_limpo)
+    gdf_bruto = baixar_wfs_paginado_mg()
+    if gdf_bruto is None or gdf_bruto.empty:
+        gdf_bruto = baixar_via_shape_zip()
 
-    if not camadas_consolidadas:
+    gdf_final = limpar_e_padronizar(gdf_bruto)
+    if gdf_final is None or gdf_final.empty:
         raise RuntimeError(
-            "Nenhuma feição válida foi obtida do servidor WFS do INCRA nesta execução. "
+            "Nenhuma feição válida de MG foi obtida do servidor GeoNode INCRA/SERPRO. "
             "A Release anterior será preservada."
         )
-
-    gdf_final = gpd.GeoDataFrame(
-        pd.concat(camadas_consolidadas, ignore_index=True),
-        crs="EPSG:4674"
-    )
-    # Remove duplicidades exatas de codigo_imo mantendo a mais recente
-    gdf_final = gdf_final.drop_duplicates(subset=["codigo_imo"], keep="first")
 
     print(f"Salvando GeoPackage consolidado com {len(gdf_final)} imóveis em {CAMINHO_GPKG}...")
     gdf_final.to_file(CAMINHO_GPKG, layer="imoveis_incra_mg", driver="GPKG")
