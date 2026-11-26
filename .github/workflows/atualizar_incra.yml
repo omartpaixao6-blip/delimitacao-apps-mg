@@ -1,0 +1,49 @@
+name: Atualizar Base INCRA MG (GeoPackage)
+
+on:
+  schedule:
+    # Roda automaticamente às 03:00 UTC (00:00 Brasília) nos dias 1 e 15 de cada mês
+    - cron: '0 3 1,15 * *'
+  workflow_dispatch:
+    # Permite que você dispare a atualização manualmente pela aba "Actions" a qualquer momento
+
+permissions:
+  contents: write
+
+jobs:
+  atualizar-base-incra:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Baixar código do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar bibliotecas geoespaciais (GeoPandas / Pyogrio)
+        run: |
+          python -m pip install --upgrade pip
+          pip install geopandas pyogrio shapely pandas
+
+      - name: Executar download, limpeza e geração do incra_mg.gpkg
+        run: |
+          python scripts/atualizar_incra_mg.py
+
+      - name: Publicar ou atualizar Release 'incra-latest'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: incra-latest
+          name: Base Atualizada INCRA MG (SIGEF/SNCI)
+          body: |
+            Base estadual de imóveis georreferenciados certificados pelo INCRA em Minas Gerais.
+            - Camada interna: `imoveis_incra_mg`
+            - CRS: `EPSG:4674` (SIRGAS 2000)
+            - Atualizada automaticamente via GitHub Actions.
+          files: dist_incra/incra_mg.zip
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
